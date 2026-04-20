@@ -216,7 +216,7 @@ def process_cohort(cohort: str) -> None:
 
 def main() -> None:
     log.info("=== CLASSIFICATION ===")
-    cohorts = config.TCGA_PROJECTS + [config.GEO_VALIDATION]
+    cohorts = config.TCGA_PROJECTS + [config.VALIDATION_COHORT]
     for c in cohorts:
         if (config.TABLES_DIR / f"labels_{c}.csv").exists():
             process_cohort(c)

@@ -38,11 +38,14 @@ for _p in (RAW_DIR, PROCESSED_DIR, GENE_SETS_DIR,
 # DATASET IDs
 # ------------------------------------------------------------------
 # Primary (training / discovery) cohort
-TCGA_PROJECTS = ["TCGA-COAD", "TCGA-READ"]
+TCGA_PROJECTS = ["TCGA-COAD"]          # 195 samples -> discovery + ML
 
-# External GEO cohorts
-GEO_VALIDATION = "GSE39582"   # 557 CRC samples  -> external validation
-GEO_SURVIVAL   = "GSE17538"   # 224 CRC samples  -> survival follow-up
+# External validation (same platform, different patients, scientifically clean)
+VALIDATION_COHORT = "TCGA-READ"        # 110 samples -> independent test
+
+# GEO cohorts disabled (kept as placeholders; pipeline scripts skip when None)
+GEO_VALIDATION = None
+GEO_SURVIVAL   = None
 
 # ------------------------------------------------------------------
 # PREPROCESSING

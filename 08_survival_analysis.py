@@ -190,7 +190,7 @@ def pls_regression(cohort: str) -> None:
 # ------------------------------------------------------------------
 def main() -> None:
     log.info("=== SURVIVAL ANALYSIS ===")
-    cohorts = config.TCGA_PROJECTS + [config.GEO_SURVIVAL]
+    cohorts = config.TCGA_PROJECTS + [config.VALIDATION_COHORT]
     for c in cohorts:
         if (config.TABLES_DIR / f"labels_{c}.csv").exists():
             kaplan_meier(c)

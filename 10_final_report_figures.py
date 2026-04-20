@@ -77,14 +77,14 @@ def composite_survival(cohort: str = "TCGA-COAD") -> None:
 
 def composite_models() -> None:
     cvs, ext = [], []
-    for c in config.TCGA_PROJECTS + [config.GEO_VALIDATION]:
+    for c in config.TCGA_PROJECTS + [config.VALIDATION_COHORT]:
         cv_path = config.TABLES_DIR / f"cv_results_{c}.csv"
         if cv_path.exists():
             d = pd.read_csv(cv_path); d["cohort"] = c; cvs.append(d)
     cv = pd.concat(cvs) if cvs else pd.DataFrame()
 
     ext_path = (config.TABLES_DIR /
-                f"external_validation_summary_{config.GEO_VALIDATION}.csv")
+                f"external_validation_summary_{config.VALIDATION_COHORT}.csv")
     if ext_path.exists():
         ext = pd.read_csv(ext_path)
     else:
@@ -100,7 +100,7 @@ def composite_models() -> None:
         sns.barplot(data=ext, x="balanced_accuracy", y="train",
                     ax=axes[1], color="coral")
         axes[1].set_xlim(0, 1)
-        axes[1].set_title(f"External validation on {config.GEO_VALIDATION}")
+        axes[1].set_title(f"External validation on {config.VALIDATION_COHORT}")
     fig.suptitle("Classifier performance", fontsize=14)
     fig.savefig(REPORT_DIR / "Fig4_model_comparison.png",
                 bbox_inches="tight", dpi=config.FIG_DPI)
@@ -109,7 +109,7 @@ def composite_models() -> None:
 
 def final_summary_table() -> None:
     rows = []
-    for c in config.TCGA_PROJECTS + [config.GEO_VALIDATION, config.GEO_SURVIVAL]:
+    for c in config.TCGA_PROJECTS + [config.VALIDATION_COHORT]:
         lab = config.TABLES_DIR / f"labels_{c}.csv"
         if not lab.exists():
             continue

@@ -178,17 +178,23 @@ def _parse_tcga_expression(extract_dir: Path,
         h["file_id"]: h["cases"][0]["submitter_id"] for h in hits
     }
 
-    frames = []
+    frames  = []
+    seen    = {}          # submitter_id -> running count (handles replicate aliquots)
     for fid, sample in tqdm(id_to_sample.items(), desc="parsing"):
         tsv = next((extract_dir / fid).glob("*.tsv"), None)
         if tsv is None:
             continue
         df = pd.read_csv(tsv, sep="\t", comment="#",
                          skiprows=[2, 3, 4, 5])
-        df = df.set_index("gene_name")[["unstranded"]]
-        df.columns = [sample]
+        # Collapse duplicated gene_name rows (PAR_Y aliases) by summing counts
+        df = df.groupby("gene_name", as_index=True)[["unstranded"]].sum()
+        # Make sample id unique across aliquot replicates
+        n = seen.get(sample, 0)
+        uniq = sample if n == 0 else f"{sample}_rep{n}"
+        seen[sample] = n + 1
+        df.columns = [uniq]
         frames.append(df)
-    expr = pd.concat(frames, axis=1).groupby(level=0).sum()
+    expr = pd.concat(frames, axis=1)
     expr.to_csv(matrix_path, sep="\t")
     log.info("Wrote %s  (%s genes x %s samples)",
              matrix_path.name, *expr.shape)
@@ -296,7 +302,8 @@ def main() -> None:
             log.error("TCGA download for %s failed: %s", project, e)
             log.error("  Manual fallback: use GDC Data Transfer Tool or cBioPortal.")
 
-    for gse in (config.GEO_VALIDATION, config.GEO_SURVIVAL):
+    geo_cohorts = [g for g in (config.GEO_VALIDATION, config.GEO_SURVIVAL) if g]
+    for gse in geo_cohorts:
         try:
             download_geo(gse)
         except Exception as e:     # noqa: BLE001

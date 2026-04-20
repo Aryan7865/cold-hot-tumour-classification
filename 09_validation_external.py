@@ -81,7 +81,7 @@ def best_model_name(train_cohort: str) -> str:
 # VALIDATION
 # ------------------------------------------------------------------
 def validate(train_cohort: str = "TCGA-COAD",
-             test_cohort:  str = config.GEO_VALIDATION) -> pd.DataFrame:
+             test_cohort:  str = config.VALIDATION_COHORT) -> pd.DataFrame:
     log.info("Validating %s -> %s", train_cohort, test_cohort)
 
     best = best_model_name(train_cohort)

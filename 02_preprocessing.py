@@ -162,7 +162,7 @@ def process_cohort(cohort: str) -> pd.DataFrame:
 
 def main() -> None:
     log.info("=== PREPROCESSING ===")
-    cohorts = config.TCGA_PROJECTS + [config.GEO_VALIDATION, config.GEO_SURVIVAL]
+    cohorts = config.TCGA_PROJECTS + [config.VALIDATION_COHORT]
     matrices = {c: process_cohort(c) for c in cohorts
                 if (config.RAW_DIR / c).exists()}
 

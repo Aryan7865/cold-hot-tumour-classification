@@ -191,7 +191,7 @@ def score_cohort(cohort: str) -> pd.DataFrame:
 
 def main() -> None:
     log.info("=== IMMUNE SCORING ===")
-    cohorts = config.TCGA_PROJECTS + [config.GEO_VALIDATION, config.GEO_SURVIVAL]
+    cohorts = config.TCGA_PROJECTS + [config.VALIDATION_COHORT]
     for c in cohorts:
         if (config.PROCESSED_DIR / f"{c}_expr_log.tsv").exists():
             score_cohort(c)
