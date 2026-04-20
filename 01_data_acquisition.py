@@ -75,8 +75,15 @@ def _gdc_query(project: str,
     return r.json()["data"]["hits"]
 
 
-def download_tcga_project(project: str) -> Path:
-    """Download STAR-Counts gene-expression files + clinical for a TCGA project."""
+def download_tcga_project(project: str, batch_size: int = 50,
+                          max_retries: int = 3) -> Path:
+    """Download STAR-Counts gene-expression files + clinical for a TCGA project.
+
+    Downloads in BATCHES of `batch_size` files to avoid GDC's habit of dropping
+    the connection on very large single-shot POSTs. Each batch is resumable —
+    if it fails, we retry; if it succeeds, the extracted folder is kept and
+    future runs skip it.
+    """
     out_dir = config.RAW_DIR / project
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -89,36 +96,73 @@ def download_tcga_project(project: str) -> Path:
         manifest_path.write_text(json.dumps(hits, indent=2))
         log.info("Found %d files for %s", len(hits), project)
 
-    # Bulk download via the /data endpoint accepts many IDs in a single tar.gz
-    file_ids = [h["file_id"] for h in hits]
-    archive  = out_dir / "expression.tar.gz"
-    if not archive.exists():
-        log.info("Downloading %d expression files ...", len(file_ids))
-        with requests.post(GDC_DATA,
-                           json={"ids": file_ids},
-                           headers={"Content-Type": "application/json"},
-                           stream=True, timeout=300) as r:
-            r.raise_for_status()
-            total = int(r.headers.get("content-length", 0))
-            with open(archive, "wb") as fh, tqdm(total=total,
-                                                 unit="B",
-                                                 unit_scale=True,
-                                                 desc=project) as pbar:
-                for chunk in r.iter_content(chunk_size=1 << 20):
-                    if chunk:
-                        fh.write(chunk)
-                        pbar.update(len(chunk))
-
     extract_dir = out_dir / "star_counts"
-    if not extract_dir.exists():
-        log.info("Extracting archive ...")
-        extract_dir.mkdir()
-        with tarfile.open(archive) as tf:
-            tf.extractall(extract_dir)
+    extract_dir.mkdir(exist_ok=True)
+
+    file_ids = [h["file_id"] for h in hits]
+    # Skip IDs we already extracted
+    pending = [fid for fid in file_ids if not (extract_dir / fid).exists()]
+    if not pending:
+        log.info("%s: all %d files already downloaded", project, len(file_ids))
+        _parse_tcga_expression(extract_dir, hits, out_dir)
+        _download_tcga_clinical(project, out_dir)
+        return out_dir
+
+    log.info("%s: downloading %d / %d files in batches of %d",
+             project, len(pending), len(file_ids), batch_size)
+
+    batches = [pending[i:i + batch_size]
+               for i in range(0, len(pending), batch_size)]
+    for bi, batch in enumerate(batches, 1):
+        _download_batch(batch, extract_dir, f"{project} batch {bi}/{len(batches)}",
+                        max_retries=max_retries)
 
     _parse_tcga_expression(extract_dir, hits, out_dir)
     _download_tcga_clinical(project, out_dir)
     return out_dir
+
+
+def _download_batch(file_ids: list[str], extract_dir: Path,
+                    desc: str, max_retries: int = 3) -> None:
+    """Download a batch of GDC files as a tar.gz, extract in place, delete tar.
+
+    Retries up to max_retries on network/decode errors. Skips files already
+    extracted (idempotent).
+    """
+    pending = [fid for fid in file_ids if not (extract_dir / fid).exists()]
+    if not pending:
+        return
+
+    tmp_tar = extract_dir / f".batch_{abs(hash(tuple(pending))) & 0xFFFFFF}.tar.gz"
+    for attempt in range(1, max_retries + 1):
+        try:
+            with requests.post(GDC_DATA,
+                               json={"ids": pending},
+                               headers={"Content-Type": "application/json"},
+                               stream=True, timeout=600) as r:
+                r.raise_for_status()
+                total = int(r.headers.get("content-length", 0))
+                with open(tmp_tar, "wb") as fh, tqdm(total=total,
+                                                    unit="B", unit_scale=True,
+                                                    desc=desc, leave=False) as pbar:
+                    for chunk in r.iter_content(chunk_size=1 << 20):
+                        if chunk:
+                            fh.write(chunk)
+                            pbar.update(len(chunk))
+            # Extract
+            with tarfile.open(tmp_tar) as tf:
+                tf.extractall(extract_dir)
+            tmp_tar.unlink(missing_ok=True)
+            return
+        except (requests.exceptions.RequestException,
+                tarfile.ReadError, EOFError, OSError) as e:
+            log.warning("  [attempt %d/%d] %s failed: %s",
+                        attempt, max_retries, desc, e)
+            tmp_tar.unlink(missing_ok=True)
+            if attempt == max_retries:
+                raise
+            import time
+            time.sleep(5 * attempt)
 
 
 def _parse_tcga_expression(extract_dir: Path,
@@ -179,8 +223,13 @@ def _download_tcga_clinical(project: str, out_dir: Path) -> None:
 # ------------------------------------------------------------------
 # GEO  (GEOparse)
 # ------------------------------------------------------------------
-def download_geo(gse_id: str) -> Path:
-    """Download a GEO series and build a simple expression + pheno table."""
+def download_geo(gse_id: str, max_retries: int = 5) -> Path:
+    """Download a GEO series and build a simple expression + pheno table.
+
+    Retries up to `max_retries` times with exponential back-off — NCBI's FTP
+    server frequently drops big transfers, and GEOparse fails hard on the
+    slightest size mismatch. Partial SOFT files are removed before each retry.
+    """
     try:
         import GEOparse
     except ImportError as e:
@@ -195,23 +244,44 @@ def download_geo(gse_id: str) -> Path:
         log.info("%s already downloaded.", gse_id)
         return out_dir
 
-    log.info("Downloading %s ...", gse_id)
-    gse = GEOparse.get_GEO(geo=gse_id, destdir=str(out_dir), silent=True)
+    import time
+    last_err: Exception | None = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            log.info("Downloading %s  (attempt %d/%d) ...",
+                     gse_id, attempt, max_retries)
+            # Remove any partial SOFT file from previous failed attempt
+            for partial in out_dir.glob("*_family.soft.gz"):
+                partial.unlink(missing_ok=True)
 
-    # Expression matrix
-    expr = pd.concat(
-        {name: gsm.table.set_index("ID_REF")["VALUE"]
-         for name, gsm in gse.gsms.items()}, axis=1
-    )
-    expr.to_csv(expr_path, sep="\t")
+            gse = GEOparse.get_GEO(geo=gse_id, destdir=str(out_dir), silent=True)
 
-    # Phenotype / clinical
-    pheno = pd.DataFrame({name: gsm.metadata for name, gsm in gse.gsms.items()}).T
-    pheno.to_csv(pheno_path, sep="\t")
+            # Expression matrix
+            frames = {}
+            for name, gsm in gse.gsms.items():
+                if not gsm.table.empty and "VALUE" in gsm.table.columns:
+                    frames[name] = gsm.table.set_index("ID_REF")["VALUE"]
+            if not frames:
+                raise RuntimeError(f"{gse_id}: no GSM tables contained VALUE column")
+            expr = pd.concat(frames, axis=1)
+            expr.to_csv(expr_path, sep="\t")
 
-    log.info("%s:  expression %s,  phenotype %s",
-             gse_id, expr.shape, pheno.shape)
-    return out_dir
+            # Phenotype
+            pheno = pd.DataFrame({name: gsm.metadata
+                                  for name, gsm in gse.gsms.items()}).T
+            pheno.to_csv(pheno_path, sep="\t")
+
+            log.info("%s:  expression %s,  phenotype %s",
+                     gse_id, expr.shape, pheno.shape)
+            return out_dir
+
+        except Exception as e:       # noqa: BLE001
+            last_err = e
+            log.warning("  [%s attempt %d/%d] failed: %s",
+                        gse_id, attempt, max_retries, e)
+            time.sleep(10 * attempt)    # 10, 20, 30, 40, 50 s
+
+    raise RuntimeError(f"{gse_id} failed after {max_retries} retries: {last_err}")
 
 
 # ------------------------------------------------------------------
