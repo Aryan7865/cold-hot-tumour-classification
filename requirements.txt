@@ -1,0 +1,26 @@
+# Core
+numpy>=1.26
+pandas>=2.2
+scipy>=1.11
+scikit-learn>=1.4
+statsmodels>=0.14
+matplotlib>=3.8
+seaborn>=0.13
+tqdm>=4.66
+
+# Dimensionality reduction
+umap-learn>=0.5.5
+
+# Bio-data
+gseapy>=1.1.3          # ssGSEA + enrichment
+GEOparse>=2.0.3        # GEO / GSE downloads
+mygene>=3.2.2          # gene ID conversion
+
+# Survival analysis
+lifelines>=0.27
+
+# Multiple testing + posthoc
+scikit-posthocs>=0.8
+
+# Optional (TCGA)
+requests>=2.31

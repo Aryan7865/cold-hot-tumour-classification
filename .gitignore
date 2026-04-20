@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# ---- project-specific ----
+
+# Raw + processed data are HUGE (several GB) -> never commit
+data/raw/
+data/processed/
+data/*.gmt
+data/*.tsv
+data/*.csv
+
+# Pipeline outputs regenerate from the scripts -> don't bloat the repo
+outputs/figures/
+outputs/models/*.pkl
+outputs/tables/*.csv
+
+# Keep a .gitkeep placeholder in empty folders so structure is preserved
+!outputs/figures/.gitkeep
+!outputs/models/.gitkeep
+!outputs/tables/.gitkeep
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+
+# Logs
+*.log
