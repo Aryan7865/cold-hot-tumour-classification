@@ -46,6 +46,10 @@ set_plot_style()
 def load_expr_and_labels(cohort: str) -> tuple[pd.DataFrame, pd.Series]:
     expr = pd.read_csv(config.PROCESSED_DIR / f"{cohort}_expr_topvar.tsv",
                        sep="\t", index_col=0)
+    # Drop any all-NaN rows, fill remaining NaNs with the row (gene) mean
+    expr = expr.dropna(how="all")
+    expr = expr.T.fillna(expr.mean(axis=1)).T
+    expr = expr.fillna(0.0)
     labels = pd.read_csv(config.TABLES_DIR / f"labels_{cohort}.csv",
                          index_col=0)["label"]
     common = expr.columns.intersection(labels.index)

@@ -54,11 +54,22 @@ def _load_clinical(cohort: str) -> pd.DataFrame:
         df = pd.read_csv(tcga, sep="\t")
         id_col = next((c for c in df.columns if "submitter" in c.lower()), None)
         df = df.set_index(id_col)
-        # Consolidate survival fields
-        time = df.get("demographic.days_to_death")
-        followup = df.get("diagnoses.days_to_last_follow_up")
-        vital = df.get("demographic.vital_status", "").fillna("").astype(str)
-        df["time"]  = time.fillna(followup)
+
+        def _first_col(substr: str) -> pd.Series:
+            """Return first column whose name contains substr, or empty series."""
+            for c in df.columns:
+                if substr in c:
+                    s = df[c]
+                    if hasattr(s, "iloc") and s.notna().any():
+                        return pd.to_numeric(s, errors="coerce")
+            return pd.Series(index=df.index, dtype=float)
+
+        time_death = _first_col("days_to_death")
+        followup   = _first_col("days_to_last_follow_up")
+        vital_col  = next((c for c in df.columns if "vital_status" in c), None)
+        vital = df[vital_col].fillna("").astype(str) if vital_col else pd.Series("", index=df.index)
+
+        df["time"]  = time_death.fillna(followup)
         df["event"] = vital.str.lower().eq("dead").astype(int)
         return df[["time", "event"]].dropna()
 
@@ -155,6 +166,8 @@ def pls_regression(cohort: str) -> None:
         return
     expr = pd.read_csv(config.PROCESSED_DIR / f"{cohort}_expr_topvar.tsv",
                        sep="\t", index_col=0)
+    expr = expr.dropna(how="all")
+    expr = expr.T.fillna(expr.mean(axis=1)).T.fillna(0.0)
 
     common = clin.index.intersection(expr.columns)
     y = pd.to_numeric(clin.loc[common, "time"], errors="coerce")

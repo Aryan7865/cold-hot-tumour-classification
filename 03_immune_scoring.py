@@ -116,7 +116,9 @@ def run_ssgsea(expr: pd.DataFrame,
         threads=4,
     )
     # res2d -> rows = (Term, Name),  'ES' column; pivot to sample x term
-    res = ss.res2d.pivot_table(index="Name", columns="Term", values="NES")
+    df = ss.res2d.copy()
+    df["NES"] = pd.to_numeric(df["NES"], errors="coerce")
+    res = df.pivot_table(index="Name", columns="Term", values="NES")
     res.index.name = "sample"
     return res
 
@@ -162,7 +164,8 @@ def plot_score_distribution(scores: pd.DataFrame,
         save_fig(fig, f"{cohort}_{col}_hist", subfolder="immune")
 
     fig, ax = plt.subplots(figsize=(10, 6))
-    sns.heatmap(scores.T, cmap="RdBu_r", center=0,
+    numeric_scores = scores.apply(pd.to_numeric, errors="coerce").dropna(axis=1, how="all")
+    sns.heatmap(numeric_scores.T, cmap="RdBu_r", center=0,
                 xticklabels=False, ax=ax)
     ax.set_title(f"ssGSEA enrichment heatmap — {cohort}")
     save_fig(fig, f"{cohort}_ssgsea_heatmap", subfolder="immune")

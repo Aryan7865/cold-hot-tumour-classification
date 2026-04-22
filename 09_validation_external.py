@@ -67,6 +67,7 @@ def load_matching_matrix(train_cohort: str,
     else:
         test_aligned = test_aligned.reindex(train.index)
 
+    test_aligned = test_aligned.fillna(0.0)
     return train, test_aligned
 
 

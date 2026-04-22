@@ -66,6 +66,8 @@ def load_xy(cohort: str, exclude_intermediate: bool = False
             ) -> tuple[pd.DataFrame, pd.Series]:
     expr = pd.read_csv(config.PROCESSED_DIR / f"{cohort}_expr_topvar.tsv",
                        sep="\t", index_col=0)
+    expr = expr.dropna(how="all")
+    expr = expr.T.fillna(expr.mean(axis=1)).T.fillna(0.0)
     labels = pd.read_csv(config.TABLES_DIR / f"labels_{cohort}.csv",
                          index_col=0)["label"]
     common = expr.columns.intersection(labels.index)
@@ -104,7 +106,6 @@ def build_models(n_features: int) -> dict[str, Pipeline]:
             ("sc",  StandardScaler()),
             ("fs",  SelectKBest(f_classif, k=k)),
             ("clf", LogisticRegression(max_iter=2000, C=1.0,
-                                       multi_class="auto",
                                        random_state=config.RANDOM_STATE)),
         ]),
         "RandomForest": Pipeline([
@@ -116,13 +117,22 @@ def build_models(n_features: int) -> dict[str, Pipeline]:
     }
     try:
         from xgboost import XGBClassifier
+        from sklearn.preprocessing import LabelEncoder
+        class _XGBWrap(XGBClassifier):
+            """XGBClassifier that auto label-encodes string y."""
+            def fit(self, X, y, **kw):
+                self._le = LabelEncoder().fit(y)
+                return super().fit(X, self._le.transform(y), **kw)
+            def predict(self, X):
+                return self._le.inverse_transform(super().predict(X))
+            def predict_proba(self, X):
+                return super().predict_proba(X)
         models["XGBoost"] = Pipeline([
             ("sc",  StandardScaler(with_mean=False)),
-            ("clf", XGBClassifier(n_estimators=500,
-                                  random_state=config.RANDOM_STATE,
-                                  eval_metric="mlogloss",
-                                  use_label_encoder=False,
-                                  n_jobs=-1)),
+            ("clf", _XGBWrap(n_estimators=500,
+                             random_state=config.RANDOM_STATE,
+                             eval_metric="mlogloss",
+                             n_jobs=-1)),
         ])
     except ImportError:
         log.info("xgboost not installed; skipping.")
