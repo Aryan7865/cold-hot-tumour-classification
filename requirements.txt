@@ -24,3 +24,9 @@ scikit-posthocs>=0.8
 
 # Optional (TCGA)
 requests>=2.31
+
+# Classification (boosted tree baseline)
+xgboost>=3.2.0
+
+# Report generation
+reportlab>=4.4

@@ -79,6 +79,14 @@ def gene_level_tests(expr: pd.DataFrame, labels: pd.Series) -> pd.DataFrame:
     for i in range(expr.shape[0]):
         kw_stat[i], kw_p[i] = stats.kruskal(hot[i], cold[i], inter[i])
 
+    # Mann-Whitney U test (non-parametric pairwise Hot vs Cold)
+    mw_stat = np.empty(expr.shape[0])
+    mw_p    = np.empty(expr.shape[0])
+    for i in range(expr.shape[0]):
+        mw_stat[i], mw_p[i] = stats.mannwhitneyu(
+            hot[i], cold[i], alternative="two-sided"
+        )
+
     # F-test of variance (Hot vs Cold)
     var_hot, var_cold = hot.var(axis=1, ddof=1), cold.var(axis=1, ddof=1)
     f_var = var_hot / np.where(var_cold > 0, var_cold, np.nan)
@@ -101,11 +109,12 @@ def gene_level_tests(expr: pd.DataFrame, labels: pd.Series) -> pd.DataFrame:
         "t_stat": t_stat, "t_p": t_p,
         "anova_F": f_stat, "anova_p": anova_p,
         "kw_stat": kw_stat, "kw_p": kw_p,
+        "mw_U": mw_stat, "mw_p": mw_p,
         "Fvar": f_var, "Fvar_p": f_var_p,
     }).set_index("gene")
 
-    # Multiple-testing correction (BH + Bonferroni) on ANOVA and t
-    for col in ("t_p", "anova_p", "kw_p"):
+    # Multiple-testing correction (BH + Bonferroni) on every p-value column
+    for col in ("t_p", "anova_p", "kw_p", "mw_p"):
         df[col + "_bh"]   = multipletests(df[col].fillna(1), method="fdr_bh")[1]
         df[col + "_bonf"] = multipletests(df[col].fillna(1), method="bonferroni")[1]
 
