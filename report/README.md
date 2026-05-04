@@ -16,7 +16,7 @@ The script pulls metrics/tables from `outputs/tables/` and figures from `outputs
 
 ## Presentation (PowerPoint)
 
-- Output: `BT3041_Cold_Hot_Tumour_Presentation.pptx`
+- Output: `BT3041_Cold_Hot_Tumour_Presentation.pptx` (~19 slides: intro, data, two-part methods, QC, immune, DR, clustering, DE, biology, ML, external validation, survival, discussion, conclusions).
 - Generator: `build_presentation.py` (metrics are read live from the same CSVs — regenerate after re-running the pipeline).
 
 ```bash

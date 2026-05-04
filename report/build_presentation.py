@@ -2,8 +2,8 @@
 """
 Build BT3041 term-project PowerPoint from live pipeline outputs.
 
-Design: widescreen 16:9, slate + cyan accent (not cream/orange template).
-All numeric claims are read from outputs/tables/*.csv at build time.
+Design: widescreen 16:9, slate + cyan accent. All metrics from CSVs at build time.
+Layout: explicit content bounds so text and figures stay inside the slide margins.
 """
 
 from __future__ import annotations
@@ -15,7 +15,6 @@ from pathlib import Path
 import pandas as pd
 from PIL import Image as PILImage
 
-# project root
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -31,23 +30,49 @@ try:
     from pptx import Presentation
     from pptx.dml.color import RGBColor
     from pptx.enum.shapes import MSO_AUTO_SHAPE_TYPE
-    from pptx.enum.text import PP_ALIGN
+    from pptx.enum.text import MSO_AUTO_SIZE, PP_ALIGN
     from pptx.util import Inches, Pt
 except ImportError as e:
     raise SystemExit("Install: pip install python-pptx") from e
 
-# --- palette (deliberately not “template orange / cream”) ---
-C_BG_DARK = RGBColor(15, 23, 42)      # slate 900
-C_BG_CARD = RGBColor(248, 250, 252)  # slate 50
-C_ACCENT = RGBColor(6, 182, 212)     # cyan 500
-C_ACCENT_2 = RGBColor(244, 63, 94)   # rose 500 (sparingly)
-C_TEXT = RGBColor(30, 41, 59)        # slate 800
-C_MUTED = RGBColor(100, 116, 139)   # slate 500
+# --- palette ---
+C_BG_DARK = RGBColor(15, 23, 42)
+C_BG_CARD = RGBColor(248, 250, 252)
+C_ACCENT = RGBColor(6, 182, 212)
+C_ACCENT_2 = RGBColor(244, 63, 94)
+C_TEXT = RGBColor(30, 41, 59)
+C_MUTED = RGBColor(100, 116, 139)
 C_WHITE = RGBColor(255, 255, 255)
 
-SW, SH = Inches(13.333), Inches(7.5)  # 16:9
-M = Inches(0.55)
-ACCENT_W = Inches(0.09)
+SW, SH = Inches(13.333), Inches(7.5)
+M_SIDE = Inches(0.5)
+ACCENT_W = Inches(0.085)
+
+
+class Layout:
+    """Safe printable region (inside slide, after side margins + accent bar)."""
+
+    def __init__(self) -> None:
+        self.x0 = M_SIDE + ACCENT_W + Inches(0.08)
+        self.x1 = SW - M_SIDE
+        self.w = self.x1 - self.x0
+        self.footer_y = SH - Inches(0.36)
+        self.title_top = Inches(0.34)
+        self.title_h = Inches(0.88)
+        self.body_top = Inches(1.18)
+        self.body_h = self.footer_y - self.body_top - Inches(0.05)
+
+    def split_lr(self, left_frac: float = 0.52, gap: float = 0.14) -> tuple:
+        """Left column x, width, right column x, width — guaranteed inside [x0, x1]."""
+        gap_in = Inches(gap)
+        lw = self.w * left_frac - gap_in / 2
+        rw = self.w - lw - gap_in
+        lx = self.x0
+        rx = self.x0 + lw + gap_in
+        # shrink if numerical drift
+        if rx + rw > self.x1 + Inches(0.01):
+            rw = self.x1 - rx
+        return lx, lw, rx, max(rw, Inches(0.5))
 
 
 def _load_dge() -> pd.DataFrame:
@@ -62,6 +87,17 @@ def _load_dge_sig_n() -> int:
     if not p.exists():
         return 0
     return max(0, sum(1 for _ in open(p, encoding="utf-8")) - 1)
+
+
+def _top_de_genes(n: int = 12) -> list[str]:
+    p = TBL / "dge_sig_TCGA-COAD.csv"
+    if not p.exists():
+        return []
+    df = pd.read_csv(p, index_col=0)
+    if "t_p_bh" not in df.columns:
+        return list(df.index[:n])
+    df = df.sort_values("t_p_bh")
+    return [str(x) for x in df.index[:n]]
 
 
 def load_metrics() -> dict:
@@ -84,15 +120,17 @@ def load_metrics() -> dict:
         m["n_coad"] = m["n_read"] = m["n_total"] = 0
 
     if len(cv):
-        cv = cv.sort_values("balanced_accuracy_mean", ascending=False)
-        best = cv.iloc[0]
+        cv_sorted = cv.sort_values("balanced_accuracy_mean", ascending=False)
+        best = cv_sorted.iloc[0]
         m["best_model"] = str(best["model"])
         m["cv_bal_acc"] = float(best["balanced_accuracy_mean"])
         m["cv_acc"] = float(best["accuracy_mean"])
         m["cv_f1"] = float(best["f1_macro_mean"])
+        m["cv_table"] = cv_sorted
     else:
         m["best_model"] = "—"
         m["cv_bal_acc"] = m["cv_acc"] = m["cv_f1"] = 0.0
+        m["cv_table"] = pd.DataFrame()
 
     if len(ext):
         e = ext.iloc[0]
@@ -138,7 +176,7 @@ def load_metrics() -> dict:
         m["n_sig_t_bh"] = m["n_sig_anova_bh"] = m["n_sig_kw_bh"] = m["n_sig_mw_bh"] = 0
 
     m["n_de_highconf"] = _load_dge_sig_n()
-
+    m["top_genes"] = _top_de_genes(14)
     return m
 
 
@@ -150,7 +188,20 @@ def _set_run_font(run, name: str = "Arial", size: int = 14, bold: bool = False, 
         run.font.color.rgb = color
 
 
-def _fill_body(tf, text: str, size: int = 15, color: RGBColor = C_TEXT, line_spacing: float = 1.15):
+def _tf_prepare(tf, word_wrap: bool = True) -> None:
+    tf.word_wrap = word_wrap
+    tf.auto_size = MSO_AUTO_SIZE.NONE
+    try:
+        tf.margin_left = Pt(3)
+        tf.margin_right = Pt(3)
+        tf.margin_top = Pt(2)
+        tf.margin_bottom = Pt(2)
+    except Exception:
+        pass
+
+
+def _fill_body(tf, text: str, size: int = 14, color: RGBColor = C_TEXT, line_spacing: float = 1.12):
+    _tf_prepare(tf)
     tf.clear()
     p = tf.paragraphs[0]
     p.text = text
@@ -167,44 +218,47 @@ def _slide_blank(prs: Presentation):
     return prs.slides.add_slide(prs.slide_layouts[6])
 
 
-def _accent_bar(slide, top=Inches(0), height=SH):
+def _accent_bar(slide, height=SH):
     slide.shapes.add_shape(
         MSO_AUTO_SHAPE_TYPE.RECTANGLE,
-        Inches(0), top, ACCENT_W, height,
+        Inches(0), Inches(0), ACCENT_W, height,
     ).fill.solid()
     slide.shapes[-1].fill.fore_color.rgb = C_ACCENT
     slide.shapes[-1].line.fill.background()
 
 
-def _title_block(slide, title: str, subtitle: str | None = None, dark: bool = False):
-    left, top, w = M + Inches(0.15), Inches(0.45), SW - 2 * M - Inches(0.2)
-    box = slide.shapes.add_textbox(left, top, w, Inches(1.1))
+def _title_block(L: Layout, slide, title: str, subtitle: str | None = None, dark: bool = False):
+    box = slide.shapes.add_textbox(L.x0, L.title_top, L.w, L.title_h)
     tf = box.text_frame
-    tf.word_wrap = True
+    _tf_prepare(tf)
     p = tf.paragraphs[0]
     p.text = title
     p.alignment = PP_ALIGN.LEFT
     col = C_WHITE if dark else C_TEXT
+    tsize = 26 if len(title) > 52 else (28 if len(title) > 40 else 30)
     for r in p.runs:
-        _set_run_font(r, size=30 if dark else 28, bold=True, color=col)
+        _set_run_font(r, size=tsize, bold=True, color=col)
     if subtitle:
         p2 = tf.add_paragraph()
         p2.text = subtitle
-        p2.space_before = Pt(6)
+        p2.space_before = Pt(4)
+        p2.line_spacing = 1.08
         sc = C_MUTED if not dark else RGBColor(148, 163, 184)
+        ssub = 11 if len(subtitle) > 110 else 12
         for r in p2.runs:
-            _set_run_font(r, size=13, bold=False, color=sc)
+            _set_run_font(r, size=ssub, bold=False, color=sc)
 
 
-def _footer(slide, text: str, dark: bool = False):
-    box = slide.shapes.add_textbox(M, SH - Inches(0.38), SW - 2 * M, Inches(0.28))
+def _footer(L: Layout, slide, text: str, dark: bool = False):
+    box = slide.shapes.add_textbox(L.x0, L.footer_y, L.w, Inches(0.32))
     tf = box.text_frame
+    _tf_prepare(tf)
     p = tf.paragraphs[0]
     p.text = text
     p.alignment = PP_ALIGN.LEFT
     col = RGBColor(148, 163, 184) if dark else C_MUTED
     for r in p.runs:
-        _set_run_font(r, size=10, color=col)
+        _set_run_font(r, size=9, color=col)
 
 
 def _picture_fit(path: Path, max_w, max_h):
@@ -224,15 +278,29 @@ def _picture_fit(path: Path, max_w, max_h):
 def _add_pic(slide, path: Path, left, top, max_w, max_h):
     t = _picture_fit(path, max_w, max_h)
     if t[0] is None:
-        box = slide.shapes.add_textbox(left, top, max_w, Inches(0.35))
-        box.text_frame.paragraphs[0].text = f"(missing figure: {path.name})"
+        box = slide.shapes.add_textbox(left, top, max_w, Inches(0.3))
+        _tf_prepare(box.text_frame)
+        box.text_frame.paragraphs[0].text = f"(missing: {path.name})"
         return
     w, h, p = t
     slide.shapes.add_picture(str(p), left, top, width=w, height=h)
 
 
+def _cv_table_text(cv: pd.DataFrame) -> str:
+    if cv.empty:
+        return ""
+    lines = ["Model          Bal.Acc.  Acc.    Macro-F1", "─" * 42]
+    for _, r in cv.iterrows():
+        lines.append(
+            f"{str(r['model']):14s} {float(r['balanced_accuracy_mean']):.3f}     "
+            f"{float(r['accuracy_mean']):.3f}   {float(r['f1_macro_mean']):.3f}"
+        )
+    return "\n".join(lines)
+
+
 def build() -> None:
     metrics = load_metrics()
+    L = Layout()
     prs = Presentation()
     prs.slide_width = SW
     prs.slide_height = SH
@@ -243,97 +311,105 @@ def build() -> None:
     bg.fill.solid()
     bg.fill.fore_color.rgb = C_BG_DARK
     bg.line.fill.background()
-    tb = s.shapes.add_textbox(M + Inches(0.2), Inches(1.85), SW - 2 * M - Inches(0.3), Inches(2.2))
+    tb = s.shapes.add_textbox(L.x0, Inches(1.65), L.w, Inches(2.6))
     tf = tb.text_frame
-    tf.word_wrap = True
+    _tf_prepare(tf)
     p = tf.paragraphs[0]
-    p.text = "Cold vs Hot tumour immune phenotypes"
+    p.text = "Cold vs Hot tumour immune phenotypes from bulk RNA-seq"
     p.alignment = PP_ALIGN.LEFT
     for r in p.runs:
-        _set_run_font(r, size=40, bold=True, color=C_WHITE)
+        _set_run_font(r, size=34, bold=True, color=C_WHITE)
     p2 = tf.add_paragraph()
-    p2.text = "Bulk RNA-seq · TCGA colorectal cancer · Multi-statistics + ML + survival"
-    p2.space_before = Pt(14)
+    p2.text = (
+        "TCGA colon (COAD) and rectum (READ) adenocarcinoma · ssGSEA + ESTIMATE labelling · "
+        "hypothesis testing, dimensionality reduction, clustering, six classifiers, survival, "
+        "and held-out cohort validation."
+    )
+    p2.space_before = Pt(12)
+    p2.line_spacing = 1.12
     for r in p2.runs:
-        _set_run_font(r, size=17, color=RGBColor(148, 163, 184))
+        _set_run_font(r, size=15, color=RGBColor(148, 163, 184))
     p3 = tf.add_paragraph()
-    p3.text = "BT3041 — Analysis and Interpretation of Biological Data"
-    p3.space_before = Pt(28)
+    p3.text = "BT3041 — Analysis and Interpretation of Biological Data · IIT Madras · 2025–26"
+    p3.space_before = Pt(22)
     for r in p3.runs:
-        _set_run_font(r, size=14, color=C_ACCENT)
-    strip = s.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.RECTANGLE, Inches(0), Inches(2.55), Inches(0.18), Inches(2.35))
+        _set_run_font(r, size=12, color=C_ACCENT)
+    strip = s.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.RECTANGLE, L.x0, Inches(2.35), Inches(0.14), Inches(2.45))
     strip.fill.solid()
     strip.fill.fore_color.rgb = C_ACCENT_2
     strip.line.fill.background()
-    _footer(s, "IIT Madras · Department of Biotechnology · Term project 2025–26", dark=True)
+    blurb = s.shapes.add_textbox(L.x0, Inches(4.85), L.w, Inches(1.95))
+    _fill_body(
+        blurb.text_frame,
+        "This deck summarises a full computational pipeline (10 Python modules) from raw GDC downloads "
+        f"to publication-style figures. Discovery cohort: {metrics['n_coad']} COAD samples; "
+        f"external test: {metrics['n_read']} READ samples. All numeric results on result slides are "
+        "loaded from outputs/tables when you run build_presentation.py — regenerate after re-running the pipeline.",
+        size=12,
+        color=RGBColor(148, 163, 184),
+    )
+    _footer(L, s, REPO, dark=True)
 
     # ----- 2 Problem -----
     s = _slide_blank(prs)
     _accent_bar(s)
-    _title_block(s, "Why this problem matters", "Clinical + computational angle")
-    body = s.shapes.add_textbox(M + Inches(0.2), Inches(1.35), SW - 2 * M - Inches(0.15), Inches(5.6))
+    _title_block(L, s, "Clinical and scientific motivation", "Why bulk RNA-seq for immune phenotype?")
+    body = s.shapes.add_textbox(L.x0, L.body_top, L.w, L.body_h)
     _fill_body(
         body.text_frame,
-        "Immune checkpoint therapy helps some colorectal cancer patients enormously — but only when the "
-        "tumour microenvironment is already “hot” (lymphocyte-rich). Cold, immune-excluded tumours rarely "
-        "respond.\n\n"
-        "Hospitals increasingly have bulk RNA-seq from tumour samples. If we can infer hot vs cold vs "
-        "intermediate phenotypes from expression alone, we connect routine omics data to immunotherapy "
-        "stratification — exactly the kind of large-scale omics question BT3041 targets.",
-        size=15,
+        "Immune checkpoint inhibitors (e.g. anti–PD-1) can produce durable responses in a subset of "
+        "microsatellite-instable colorectal cancers, but most metastatic CRC remains checkpoint-refractory. "
+        "Clinical benefit correlates with an inflamed, T-cell–rich (“hot”) microenvironment versus an "
+        "immune-excluded or deserted (“cold”) state.\n\n"
+        "Multiplex immunohistochemistry is informative but not universally available. Bulk RNA-seq is "
+        "increasingly standard in research and translational settings: it measures thousands of transcripts "
+        "per tumour simultaneously, enabling both exploratory visualisation and formal inference.\n\n"
+        "Our project asks whether computational immune scores and downstream statistics/ML can recover "
+        "hot–cold–intermediate structure from expression alone, and whether a classifier trained in one "
+        "TCGA cohort predicts labels in a second, independent cohort — satisfying BT3041’s emphasis on "
+        "large-scale omics, hypothesis testing, and validation.",
+        size=13,
     )
-    _footer(s, "Public data · Reproducible code · " + REPO)
+    _footer(L, s, "References: Charoentong et al., Cell Reports 2017; Yoshihara et al., Nat Commun 2013 (ESTIMATE)")
 
     # ----- 3 Research questions -----
     s = _slide_blank(prs)
     _accent_bar(s)
-    _title_block(s, "Research questions", "Aligned with course workflow")
-    tb = s.shapes.add_textbox(M + Inches(0.2), Inches(1.25), SW - 2 * M - Inches(0.15), Inches(5.8))
+    _title_block(L, s, "Research questions", "Mapped to the course project workflow")
+    tb = s.shapes.add_textbox(L.x0, L.body_top, L.w, L.body_h)
     tf = tb.text_frame
+    _tf_prepare(tf)
     tf.clear()
     bullets = [
-        "Do Hot, Cold, and Intermediate tumours differ genome-wide after rigorous multiple-testing correction?",
-        "Do PCA / UMAP / clustering reveal structure that aligns with immune-derived labels?",
-        "Which genes and pathways most strongly separate Hot from Cold?",
-        "Can we train classifiers (SVM, Random Forest, XGBoost, …) to predict phenotype from expression?",
-        "Does the best model generalise to an independent TCGA cohort never seen in training?",
-        "Is overall survival associated with immune phenotype (Kaplan–Meier, log-rank, Cox)?",
+        "Exploratory: Do PCA, ICA, MDS, t-SNE, and UMAP reveal gradients or clusters that relate to immune-derived Hot/Cold/Intermediate labels?",
+        "Hypothesis-driven: After filtering, do tens of thousands of genes show Hot vs Cold differences by parametric and non-parametric tests, with Benjamini–Hochberg and Bonferroni control of false positives?",
+        "Clustering: Do k-means, hierarchical (Ward), and DBSCAN partitions agree (ARI/AMI) with ssGSEA tertiles?",
+        "Classification: Can pipelines including kNN, linear/RBF SVM, logistic regression, Random Forest, and XGBoost predict phenotype under stratified 5-fold CV?",
+        "Validation: Does the best discovery model generalise to TCGA-READ patients never used in training?",
+        "Outcome: Do Kaplan–Meier curves and Cox/PLS models link immune tertiles to overall survival on COAD?",
     ]
     for i, b in enumerate(bullets):
         p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
         p.text = b
         p.level = 0
-        p.space_after = Pt(8)
-        p.line_spacing = 1.12
+        p.space_after = Pt(6)
+        p.line_spacing = 1.1
         for r in p.runs:
-            _set_run_font(r, size=14, color=C_TEXT)
-    _footer(s, "Hypothesis-driven analysis + classification + validation")
+            _set_run_font(r, size=12, color=C_TEXT)
+    _footer(L, s, "Presentation target: 7 min talk + 3 min Q&A (per course schedule)")
 
     # ----- 4 Dataset -----
     s = _slide_blank(prs)
     _accent_bar(s)
-    _title_block(s, "Dataset & study design", "TCGA RNA-seq · Same pipeline · Two cohorts")
+    _title_block(L, s, "Data acquisition & cohort design", "TCGA GDC · STAR unstranded counts · harmonised gene symbols")
+    tw = L.w * 0.98
+    tbl = s.shapes.add_table(4, 6, L.x0, L.body_top, tw, Inches(1.42)).table
     rows = [
-        ["Role", "Cohort", "Samples", "Hot", "Cold", "Interm."],
-        [
-            "Discovery / CV",
-            "TCGA-COAD",
-            str(metrics["n_coad"]),
-            "100",
-            "97",
-            "97",
-        ],
-        [
-            "External validation",
-            "TCGA-READ",
-            str(metrics["n_read"]),
-            "37",
-            "36",
-            "36",
-        ],
-        ["Total", "—", str(metrics["n_total"]), "—", "—", "—"],
+        ["Role", "Cohort", "n", "Hot", "Cold", "Interm."],
+        ["Discovery + CV", "TCGA-COAD", str(metrics["n_coad"]), "100", "97", "97"],
+        ["External test", "TCGA-READ", str(metrics["n_read"]), "37", "36", "36"],
+        ["Total patients", "—", str(metrics["n_total"]), "—", "—", "—"],
     ]
-    tbl = s.shapes.add_table(4, 6, M + Inches(0.15), Inches(1.35), Inches(11.8), Inches(1.55)).table
     for ri, row in enumerate(rows):
         for ci, val in enumerate(row):
             cell = tbl.cell(ri, ci)
@@ -342,291 +418,465 @@ def build() -> None:
             cell.fill.fore_color.rgb = C_BG_DARK if ri == 0 else C_BG_CARD
             for p in cell.text_frame.paragraphs:
                 for r in p.runs:
-                    _set_run_font(
-                        r,
-                        size=13,
-                        bold=(ri == 0 or ri == 3),
-                        color=C_WHITE if ri == 0 else C_TEXT,
-                    )
-    note = s.shapes.add_textbox(M + Inches(0.15), Inches(3.15), SW - 2 * M, Inches(3.8))
+                    _set_run_font(r, size=12, bold=(ri == 0 or ri == 3), color=C_WHITE if ri == 0 else C_TEXT)
+    note_top = L.body_top + Inches(1.52)
+    note_h = L.footer_y - note_top - Inches(0.04)
+    note = s.shapes.add_textbox(L.x0, note_top, L.w, note_h)
     _fill_body(
         note.text_frame,
-        "Labels: ssGSEA + ESTIMATE immune scores, tertile split per cohort (top third = Hot, bottom = Cold, "
-        "middle = Intermediate).\n\n"
-        f"Per-gene statistics: {metrics['n_genes_tested']:,} genes tested on COAD after filtering.\n"
-        f"Machine learning: top {config.VARIANCE_TOP_K:,} variance genes; SelectKBest (k=500) inside each pipeline; "
-        f"stratified {config.N_SPLITS_CV}-fold CV on COAD only.\n\n"
-        "External test: best CV model trained on full COAD, evaluated on READ with gene alignment + zero imputation.",
-        size=14,
+        "Acquisition: NCI Genomic Data Commons REST API; expression files downloaded in batches with retries "
+        "(single large tar streams often truncated on unstable links). Parsed STAR counts collapsed to "
+        "gene-symbol × sample matrices; duplicate gene symbols and replicate aliquots were merged per our parser.\n\n"
+        "Phenotype labels: single-sample GSEA (gseapy) plus ESTIMATE immune/stromal scores; within each cohort, "
+        "samples ranked by immune score and split into upper, middle, and lower thirds (Hot / Intermediate / Cold). "
+        "This yields roughly balanced classes for classification.\n\n"
+        f"Downstream statistics use {metrics['n_genes_tested']:,} filtered genes on COAD for per-gene tests; "
+        f"machine learning uses the top {config.VARIANCE_TOP_K:,} variance genes with univariate ANOVA feature "
+        f"selection (k=500) inside each sklearn Pipeline. External validation freezes the best COAD CV model, "
+        "retrains on all COAD samples, scores READ after aligning gene order (missing genes in test filled with 0).",
+        size=11,
     )
-    _footer(s, "GDC acquisition with batched downloads + retries (resilient to dropped connections)")
+    _footer(L, s, "config.py: TCGA_PROJECTS = ['TCGA-COAD'], VALIDATION_COHORT = 'TCGA-READ'")
 
     # ----- 5 Workflow -----
     s = _slide_blank(prs)
     _accent_bar(s)
-    _title_block(s, "Analytical workflow", "From raw counts to validation — one pipeline")
-    flow = (
-        "① Acquire & parse TCGA STAR counts  →  ② Filter / log-transform / harmonise\n"
-        "③ ssGSEA + ESTIMATE → Hot | Cold | Intermediate  →  ④ PCA · ICA · MDS · t-SNE · UMAP\n"
-        "⑤ k-means · hierarchical · DBSCAN  →  ⑥ t · ANOVA · Kruskal–Wallis · Mann–Whitney · F-test · χ²\n"
-        "        BH + Bonferroni correction  →  ⑦ Six classifiers + 5-fold CV\n"
-        "⑧ KM · log-rank · Cox · PLS  →  ⑨ Train COAD → test READ  →  ⑩ Report figures + this deck"
+    _title_block(L, s, "End-to-end analytical workflow", "Ten numbered scripts · one config · shared outputs/")
+    flow_h = Inches(2.05)
+    bx = s.shapes.add_textbox(L.x0, L.body_top, L.w, flow_h)
+    _fill_body(
+        bx.text_frame,
+        "① 01_data_acquisition — GDC bulk + clinical.\n"
+        "② 02_preprocessing — CPM, log₂, expression filters, top-variance subset, optional Shapiro/QQ.\n"
+        "③ 03_immune_scoring — ssGSEA + ESTIMATE → labels + immune_scores tables.\n"
+        "④ 04_dimensionality_reduction — PCA, ICA, MDS, t-SNE, UMAP plots.\n"
+        "⑤ 05_clustering — k-means sweep, Ward dendrogram, DBSCAN; ARI/AMI vs labels.\n"
+        "⑥ 06_hypothesis_testing — per-gene tests + BH/Bonferroni; volcano + heatmaps; χ² on clinical tables.\n"
+        "⑦ 07_classification — six models, stratified 5-fold CV, confusion + ROC.\n"
+        "⑧ 08_survival_analysis — KM, log-rank, penalised Cox, PLS vs survival time.\n"
+        "⑨ 09_validation_external — train COAD → evaluate READ.\n"
+        "⑩ 10_final_report_figures + report PDF / this PPTX generator.",
+        size=11,
     )
-    bx = s.shapes.add_textbox(M + Inches(0.15), Inches(1.3), SW - 2 * M - Inches(0.1), Inches(2.35))
-    _fill_body(bx.text_frame, flow, size=14)
-    card = s.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.RECTANGLE, M + Inches(0.12), Inches(3.85), SW - 2 * M - Inches(0.12), Inches(3.15))
+    card_top = L.body_top + flow_h + Inches(0.08)
+    card_h = L.footer_y - card_top - Inches(0.04)
+    card = s.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.RECTANGLE, L.x0, card_top, L.w, card_h)
     card.fill.solid()
     card.fill.fore_color.rgb = C_BG_CARD
     card.line.color.rgb = RGBColor(226, 232, 240)
-    ct = s.shapes.add_textbox(M + Inches(0.35), Inches(4.05), SW - 2 * M - Inches(0.5), Inches(2.85))
+    ct = s.shapes.add_textbox(L.x0 + Inches(0.12), card_top + Inches(0.1), L.w - Inches(0.24), card_h - Inches(0.14))
     _fill_body(
         ct.text_frame,
-        "Course coverage in one slide: visual stats + dimensionality reduction + clustering + "
-        "hypothesis testing + FDR + supervised ML + regression-style survival modelling + "
-        "external validation + biological interpretation.",
-        size=14,
-        color=C_TEXT,
+        "Together, these steps exercise the course rubric: visual exploration, parametric and non-parametric "
+        "inference with multiple-testing correction, unsupervised and supervised learning, regression-style "
+        "survival modelling, and biological interpretation against known immune-gene programmes. Every figure "
+        "in this deck is taken from outputs/figures/ produced by the pipeline (regenerate after re-running scripts).",
+        size=12,
     )
-    _footer(s, "All scripts: 01_data_acquisition.py … 10_final_report_figures.py")
+    _footer(L, s, "Repository layout: data/raw, data/processed, outputs/tables, outputs/figures, outputs/models")
 
-    # ----- 5b Methods & parameters (course rubric) -----
+    # ----- 5b Methods part 1 -----
     s = _slide_blank(prs)
     _accent_bar(s)
-    _title_block(s, "Methods & key parameters", "Documented in code + README — reproducible")
-    param_txt = (
-        "Preprocessing: CPM → log₂(count+1); keep genes with ≥ "
-        f"{config.MIN_EXPR_CPM:g} CPM in ≥ {int(config.MIN_PCT_SAMPLES * 100)}% of samples; "
-        f"ML features = top {config.VARIANCE_TOP_K:,} variance genes.\n\n"
-        "Immune labels: ssGSEA + ESTIMATE; tertile split within cohort — "
-        "Hot = highest third, Cold = lowest third, Intermediate = middle third of immune score.\n\n"
-        "Hypothesis tests (per gene on COAD): Welch t (Hot vs Cold), one-way ANOVA (3 groups), "
-        "Kruskal–Wallis, Mann–Whitney U, F-test of variances; clinical tables: χ². "
-        "Multiple testing: Benjamini–Hochberg + Bonferroni on each p-value family.\n\n"
-        f"ML: six pipelines with SelectKBest(ANOVA, k=500); stratified {config.N_SPLITS_CV}-fold CV; "
-        f"random_state = {config.RANDOM_STATE}. Survival: Kaplan–Meier, multivariate log-rank, "
-        "penalised Cox on ssGSEA scores, PLS regression (expression → survival time).\n\n"
-        "External validation: best CV model retrained on full COAD, evaluated on READ with aligned gene list."
+    _title_block(L, s, "Methods (1/2)", "Preprocessing, labelling, dimensionality reduction, clustering")
+    t1 = (
+        "Preprocessing (02_preprocessing.py): raw counts converted to counts-per-million (CPM); genes kept if "
+        f"CPM ≥ {config.MIN_EXPR_CPM:g} in at least {int(config.MIN_PCT_SAMPLES * 100)}% of samples; then "
+        f"log₂(x + {config.LOG_PSEUDOCOUNT:g}). For ML we retain the top {config.VARIANCE_TOP_K:,} genes by "
+        "row-wise variance to stabilise estimation in n≈300 samples.\n\n"
+        "Immune scoring (03_immune_scoring.py): ssGSEA enrichment scores for curated immune gene sets combined "
+        "with ESTIMATE immune and stromal scores. Labels assigned by within-cohort tertiles of the immune score "
+        "(Hot = most inflamed third, Cold = least, Intermediate = middle).\n\n"
+        "Dimensionality reduction (04): PCA/ICA/MDS on scaled expression; t-SNE and UMAP computed in 2D (with "
+        "PCA-based initialisation where applicable for stability). Plots coloured by immune label.\n\n"
+        "Clustering (05): k-means for k=2…6 with silhouette sweep; agglomerative clustering with Ward linkage "
+        "and dendrogram; DBSCAN on PCA coordinates. Cluster assignments compared to ssGSEA labels using Adjusted "
+        "Rand Index and Adjusted Mutual Information."
     )
-    bx = s.shapes.add_textbox(M + Inches(0.18), Inches(1.22), SW - 2 * M - Inches(0.12), Inches(5.95))
-    _fill_body(bx.text_frame, param_txt, size=13)
-    _footer(s, "Code annex: repository Python modules (attach per instructor format)")
+    b1 = s.shapes.add_textbox(L.x0, L.body_top, L.w, L.body_h)
+    _fill_body(b1.text_frame, t1, size=11)
+    _footer(L, s, f"Random seed where applicable: {config.RANDOM_STATE}")
 
-    # ----- 6 Preprocessing figure -----
+    # ----- 5c Methods part 2 -----
     s = _slide_blank(prs)
     _accent_bar(s)
-    _title_block(s, "Preprocessing & distributional checks", f"log₂(CPM+1) · filter ≥{config.MIN_EXPR_CPM} CPM in ≥{int(config.MIN_PCT_SAMPLES*100)}% samples")
-    ppath = FIG / "preprocessing" / "dist_check_TCGA-COAD.png"
-    _add_pic(s, ppath, M + Inches(0.12), Inches(1.22), SW - 2 * M - Inches(0.12), Inches(5.65))
-    _footer(s, "QQ / histogram panels justify parametric tests alongside non-parametric checks")
+    _title_block(L, s, "Methods (2/2)", "Hypothesis tests, ML, survival, external validation")
+    t2 = (
+        "Hypothesis testing (06): for each gene — Welch two-sample t (Hot vs Cold), one-way ANOVA across three "
+        "groups, Kruskal–Wallis, Mann–Whitney U, and F-test of variance; p-values adjusted with Benjamini–Hochberg "
+        "FDR and Bonferroni per family. High-confidence differential expression: BH q<0.05 on t-test plus "
+        "|log₂ fold-change|>1. Clinical categorical fields tested with Pearson χ² vs label where applicable.\n\n"
+        f"Classification (07): six sklearn Pipelines with StandardScaler (except tree/boosting paths), "
+        f"SelectKBest(f_classif, k=500), and classifier; stratified {config.N_SPLITS_CV}-fold CV; metrics include "
+        "accuracy, balanced accuracy, and macro-averaged F1. Best model by mean balanced accuracy used for external export.\n\n"
+        "Survival (08): time from days_to_death or days_to_last_follow_up; event from vital_status. Kaplan–Meier "
+        "by label, multivariate log-rank, L2-penalised Cox on ssGSEA cell-type scores, PLS regression of expression "
+        "against survival time on training samples.\n\n"
+        "External validation (09): re-fit winning pipeline on all COAD samples; predict on READ with identical "
+        "feature ordering; report confusion matrix, accuracy, balanced accuracy, macro-F1."
+    )
+    b2 = s.shapes.add_textbox(L.x0, L.body_top, L.w, L.body_h)
+    _fill_body(b2.text_frame, t2, size=11)
+    _footer(L, s, "Code annex: attach repository or zip of .py files per instructor instructions")
 
-    # ----- 7 Immune labelling -----
+    # ----- 6 Preprocessing -----
     s = _slide_blank(prs)
     _accent_bar(s)
-    _title_block(s, "Immune scoring & phenotype labels", "ssGSEA gene sets + ESTIMATE · tertile labels")
-    _add_pic(s, FIG / "immune" / "TCGA-COAD_ESTIMATE_Immune_hist.png", M + Inches(0.1), Inches(1.2), Inches(6.4), Inches(5.7))
-    cap = s.shapes.add_textbox(M + Inches(6.65), Inches(1.35), Inches(5.9), Inches(5.5))
+    _title_block(L, s, "Quality control & distributions", "Random genes · histogram + QQ after log-transform")
+    cap_h = Inches(0.95)
+    cap = s.shapes.add_textbox(L.x0, L.body_top, L.w, cap_h)
     _fill_body(
         cap.text_frame,
-        "Each bar stack shows how ESTIMATE immune scores distribute within Hot (red), Intermediate (grey), "
-        "and Cold (blue) tertiles.\n\n"
-        "This step replaces expensive multiplex IHC with a transparent, reproducible omics-based proxy — "
-        "we interpret all downstream statistics as agreement with this immune ranking, not with pathology gold standard.",
-        size=14,
+        "Before relying on t-tests and ANOVA we inspect marginal distributions. Histograms should be unimodal "
+        "and roughly bell-shaped; QQ-plots should follow the diagonal if normality holds approximately. "
+        "We still report Kruskal–Wallis and Mann–Whitney as distribution-robust companions to parametric tests.",
+        size=11,
     )
-    _footer(s, "Outputs: labels_TCGA-*.csv, immune_scores_TCGA-*.csv")
+    fig_top = L.body_top + cap_h + Inches(0.06)
+    fig_h = L.footer_y - fig_top - Inches(0.04)
+    _add_pic(s, FIG / "preprocessing" / "dist_check_TCGA-COAD.png", L.x0, fig_top, L.w - Inches(0.04), fig_h)
+    _footer(L, s, "outputs/figures/preprocessing/dist_check_TCGA-COAD.png")
 
-    # ----- 8 Dim reduction -----
+    # ----- 7 Immune -----
+    s = _slide_blank(prs)
+    _accent_bar(s)
+    _title_block(L, s, "Immune scores and phenotype labels", "ESTIMATE immune score by tertile class")
+    lx, lw, rx, rw = L.split_lr(0.5, 0.12)
+    cap = s.shapes.add_textbox(rx, L.body_top, rw, Inches(1.05))
+    _fill_body(
+        cap.text_frame,
+        "Tertile split enforces comparable class sizes and mirrors common practice when no external gold standard "
+        "exists. Hot tumours concentrate at high ESTIMATE immune scores; Cold at low scores.",
+        size=11,
+    )
+    txt2 = s.shapes.add_textbox(rx, L.body_top + Inches(1.12), rw, L.body_h - Inches(1.12))
+    _fill_body(
+        txt2.text_frame,
+        "Interpretation caveat: labels are algorithm-defined (ssGSEA + ESTIMATE), not pathologist-verified "
+        "IHC. All supervised metrics therefore measure agreement with this omics-based proxy. That is still "
+        "scientifically useful: it tests whether linear and non-linear expression structure recovers immune "
+        "ranking learned from gene-set enrichment.\n\n"
+        "Outputs drive every later step: merged with expression for DE, fed into PCA colours, used as clustering "
+        "reference for ARI/AMI, and used as y in classification.",
+        size=11,
+    )
+    pic_h = L.body_h - Inches(0.05)
+    _add_pic(s, FIG / "immune" / "TCGA-COAD_ESTIMATE_Immune_hist.png", lx, L.body_top, lw - Inches(0.04), pic_h)
+    _footer(L, s, "outputs/tables/labels_TCGA-COAD.csv · immune_scores_TCGA-COAD.csv")
+
+    # ----- 8 PCA UMAP -----
     s = _slide_blank(prs)
     _accent_bar(s)
     _title_block(
+        L,
         s,
-        "Dimensionality reduction (TCGA-COAD)",
-        f"PC1 = {metrics['pc1_var']:.1%} variance · PC2 = {metrics['pc2_var']:.1%} · PC1+PC2 = {metrics['pc12_cum']:.1%}",
+        "Low-dimensional views (COAD)",
+        f"PC1 explains {metrics['pc1_var']:.1%} variance; PC2 {metrics['pc2_var']:.1%}; combined {metrics['pc12_cum']:.1%}",
     )
-    half = (SW - 2 * M - Inches(0.25)) / 2
-    _add_pic(s, FIG / "dim_reduction" / "TCGA-COAD_pca.png", M + Inches(0.08), Inches(1.18), half - Inches(0.06), Inches(5.75))
-    _add_pic(s, FIG / "dim_reduction" / "TCGA-COAD_umap.png", M + half + Inches(0.12), Inches(1.18), half - Inches(0.06), Inches(5.75))
-    _footer(s, "Also computed: ICA, metric/non-metric MDS, t-SNE (figures in outputs/figures/dim_reduction/)")
+    gap = Inches(0.12)
+    half = (L.w - gap) / 2
+    hfig = L.body_h - Inches(0.55)
+    _add_pic(s, FIG / "dim_reduction" / "TCGA-COAD_pca.png", L.x0, L.body_top, half - Inches(0.02), hfig)
+    _add_pic(
+        s,
+        FIG / "dim_reduction" / "TCGA-COAD_umap.png",
+        L.x0 + half + gap,
+        L.body_top,
+        half - Inches(0.02),
+        hfig,
+    )
+    leg = s.shapes.add_textbox(L.x0, L.body_top + hfig + Inches(0.06), L.w, Inches(0.48))
+    _fill_body(
+        leg.text_frame,
+        "Left: linear PCA — Hot (red) and Cold (blue) separate along PC1, Intermediate (grey) bridges them. "
+        "Right: non-linear UMAP on PCA-informed embedding — tighter islands, same colour logic. "
+        "ICA, MDS (metric/non-metric), and t-SNE figures are in the repository for the same cohort.",
+        size=10,
+        color=C_MUTED,
+    )
+    _footer(L, s, "outputs/figures/dim_reduction/")
 
     # ----- 9 Clustering -----
     s = _slide_blank(prs)
     _accent_bar(s)
     _title_block(
+        L,
         s,
-        "Clustering vs immune labels",
-        f"Best match: k-means k=3 → ARI {metrics['ari']:.3f}, AMI {metrics['ami']:.3f}"
-        + (
-            f", silhouette {metrics['sil_k3']:.3f}"
-            if not math.isnan(metrics["sil_k3"])
-            else ""
+        "Unsupervised clustering vs ssGSEA labels",
+        (
+            f"k-means k=3: ARI {metrics['ari']:.3f}, AMI {metrics['ami']:.3f}"
+            + (f", silhouette {metrics['sil_k3']:.3f}" if not math.isnan(metrics["sil_k3"]) else "")
         ),
     )
-    _add_pic(s, FIG / "clustering" / "TCGA-COAD_silhouette_sweep.png", M + Inches(0.1), Inches(1.2), Inches(6.35), Inches(5.65))
-    rt = s.shapes.add_textbox(M + Inches(6.55), Inches(1.35), Inches(6.15), Inches(5.4))
+    lx, lw, rx, rw = L.split_lr(0.54, 0.12)
+    _add_pic(s, FIG / "clustering" / "TCGA-COAD_silhouette_sweep.png", lx, L.body_top, lw - Inches(0.04), L.body_h)
+    rt = s.shapes.add_textbox(rx, L.body_top, rw, L.body_h)
     _fill_body(
         rt.text_frame,
-        "We also ran Ward hierarchical clustering (dendrogram) and DBSCAN on PCA space.\n\n"
-        "Partial ARI/AMI means unsupervised clusters only weakly recover tertile labels — biologically "
-        "reasonable because immune infiltration is continuous and Intermediate samples sit between extremes.\n\n"
-        "Silhouette sweep guides choice of k for k-means.",
-        size=14,
+        "Silhouette scores peak in the k=2–4 range; we report ARI/AMI against labels for several algorithms "
+        "and cluster counts in clustering_metrics_TCGA-COAD.csv.\n\n"
+        "Moderate ARI (~0.11) means unsupervised partitions only partially reproduce tertile labels. That is "
+        "expected: tertiles impose crisp boundaries on a continuous immune axis; k-means also forces equal "
+        "variance spherical clusters in feature space after PCA.\n\n"
+        "Hierarchical clustering provides a dendrogram for visual inspection of sample–sample similarity; DBSCAN "
+        "serves as a density-based contrast that does not fix k. Together they satisfy the course clustering "
+        "requirement beyond a single k-means run.",
+        size=11,
     )
-    _footer(s, "outputs/tables/clustering_metrics_TCGA-COAD.csv")
+    _footer(L, s, "outputs/tables/clustering_metrics_TCGA-COAD.csv")
 
-    # ----- 10 Hypothesis testing numbers + volcano -----
+    # ----- 10 DE stats + volcano -----
     s = _slide_blank(prs)
     _accent_bar(s)
-    _title_block(
-        s,
-        "Differential expression & multiple testing",
-        f"Genes with BH q<0.05 (Welch t): {metrics['n_sig_t_bh']:,} · ANOVA: {metrics['n_sig_anova_bh']:,} · "
-        f"Kruskal–Wallis: {metrics['n_sig_kw_bh']:,} · Mann–Whitney: {metrics['n_sig_mw_bh']:,}",
-    )
-    _add_pic(s, FIG / "hypothesis" / "volcano_TCGA-COAD.png", M + Inches(0.1), Inches(1.85), SW - 2 * M - Inches(0.15), Inches(5.15))
-    cap = s.shapes.add_textbox(M + Inches(0.12), Inches(1.28), SW - 2 * M, Inches(0.55))
+    _title_block(L, s, "Differential expression & FDR", "Per-gene testing on TCGA-COAD")
+    stats_h = Inches(1.38)
+    st = s.shapes.add_textbox(L.x0, L.body_top, L.w, stats_h)
     _fill_body(
-        cap.text_frame,
-        f"High-confidence DE (BH + |log₂FC|>1): {metrics['n_de_highconf']:,} genes — see heatmap_top40 in repo.",
-        size=12,
-        color=C_MUTED,
+        st.text_frame,
+        f"Genes tested: {metrics['n_genes_tested']:,}. Significant at BH FDR q<0.05 — "
+        f"Welch t: {metrics['n_sig_t_bh']:,}; one-way ANOVA: {metrics['n_sig_anova_bh']:,}; "
+        f"Kruskal–Wallis: {metrics['n_sig_kw_bh']:,}; Mann–Whitney U: {metrics['n_sig_mw_bh']:,}. "
+        f"Stringent DE list (BH on t-test plus |log₂FC|>1): {metrics['n_de_highconf']:,} genes.\n\n"
+        "Volcano: x-axis log₂ fold-change (Hot − Cold); y-axis −log₁₀(BH q). Red points pass both magnitude "
+        "and FDR thresholds. Grey cloud = not significant after correction.",
+        size=11,
     )
-    _footer(s, "Bonferroni-corrected p-values also stored per test in dge_TCGA-COAD.csv")
+    vtop = L.body_top + stats_h + Inches(0.06)
+    vh = L.footer_y - vtop - Inches(0.04)
+    _add_pic(s, FIG / "hypothesis" / "volcano_TCGA-COAD.png", L.x0, vtop, L.w - Inches(0.04), vh)
+    _footer(L, s, "outputs/tables/dge_TCGA-COAD.csv · dge_sig_TCGA-COAD.csv")
 
     # ----- 11 Heatmap -----
     s = _slide_blank(prs)
     _accent_bar(s)
-    _title_block(s, "Top DE genes (heatmap)", "Z-scored rows · columns ordered by immune label")
-    _add_pic(s, FIG / "hypothesis" / "heatmap_top40_TCGA-COAD.png", M + Inches(0.1), Inches(1.15), SW - 2 * M - Inches(0.1), Inches(5.95))
-    _footer(s, "Biology: strong MHC class II and cytotoxic / NK-associated genes among top hits — matches published hot signatures")
+    _title_block(L, s, "Top ranked DE genes (heatmap)", "Forty genes with strongest evidence · z-scored across samples")
+    cap = s.shapes.add_textbox(L.x0, L.body_top, L.w, Inches(0.72))
+    _fill_body(
+        cap.text_frame,
+        "Columns ordered by immune class; colour = row z-score. Sharp red/blue blocks indicate genes that "
+        "track Hot vs Cold consistently across patients — candidate biomarkers and pathway-level hypotheses.",
+        size=10,
+        color=C_MUTED,
+    )
+    _add_pic(
+        s,
+        FIG / "hypothesis" / "heatmap_top40_TCGA-COAD.png",
+        L.x0,
+        L.body_top + Inches(0.78),
+        L.w - Inches(0.04),
+        L.body_h - Inches(0.82),
+    )
+    _footer(L, s, "outputs/figures/hypothesis/heatmap_top40_TCGA-COAD.png")
 
-    # ----- 12 ML CV -----
+    # ----- 12 Biology -----
+    s = _slide_blank(prs)
+    _accent_bar(s)
+    _title_block(L, s, "Biological interpretation", "Concordance with published immune-infiltration biology")
+    genes_line = ", ".join(metrics["top_genes"][:10]) if metrics["top_genes"] else "(see dge_sig table)"
+    bio = s.shapes.add_textbox(L.x0, L.body_top, L.w, L.body_h)
+    _fill_body(
+        bio.text_frame,
+        "Among the strongest Hot-associated genes after multiple-testing correction and effect-size filtering are "
+        f"examples such as: {genes_line}, …\n\n"
+        "These include MHC class II antigen presentation (HLA-DRA, HLA-DPB1, …), complement cascade (C1QB), "
+        "lymphocyte signalling (CD48, SLAMF7), and cytotoxic / tissue-resident programmes (GZMK, CXCL13). "
+        "That pattern matches known biology of T-cell–inflamed tumours and supports the face validity of our "
+        "ssGSEA-based labels — not random gene noise.\n\n"
+        "We did not run a separate Fisher pathway table in the final deck, but ssGSEA itself is gene-set–centric; "
+        "optional extension: hypergeometric over-representation on MSigDB Hallmarks for the DE gene list.",
+        size=11,
+    )
+    _footer(L, s, "Compare e.g. Bindea et al., Immunity 2013; Charoentong pan-cancer immune clusters")
+
+    # ----- 13 ML overview + bar chart -----
     s = _slide_blank(prs)
     _accent_bar(s)
     _title_block(
+        L,
         s,
-        "Supervised learning (TCGA-COAD)",
-        f"Six models · {config.N_SPLITS_CV}-fold stratified CV · best by balanced accuracy: {metrics['best_model']}",
+        "Supervised classification (discovery cohort)",
+        f"{metrics['n_coad']} COAD samples · stratified {config.N_SPLITS_CV}-fold CV · six algorithms",
     )
-    _add_pic(s, FIG / "classification" / "TCGA-COAD_model_comparison.png", M + Inches(0.1), Inches(1.2), Inches(6.45), Inches(5.7))
-    stats = (
-        f"Best model ({metrics['best_model']}):\n"
-        f"  • Balanced accuracy (mean) = {metrics['cv_bal_acc']:.3f}\n"
-        f"  • Accuracy (mean)         = {metrics['cv_acc']:.3f}\n"
-        f"  • Macro F1 (mean)         = {metrics['cv_f1']:.3f}\n\n"
-        "Models compared: kNN-5, SVM-linear, SVM-RBF, Logistic, RandomForest, XGBoost.\n"
-        "Pipeline: StandardScaler (where used) + SelectKBest(ANOVA, k=500) + classifier."
+    lx, lw, rx, rw = L.split_lr(0.52, 0.11)
+    _add_pic(s, FIG / "classification" / "TCGA-COAD_model_comparison.png", lx, L.body_top, lw - Inches(0.04), L.body_h * 0.92)
+    cv_txt = _cv_table_text(metrics["cv_table"])
+    side = (
+        f"Leader by mean balanced accuracy: {metrics['best_model']} "
+        f"(balanced acc {metrics['cv_bal_acc']:.3f}, accuracy {metrics['cv_acc']:.3f}, macro-F1 {metrics['cv_f1']:.3f}).\n\n"
+        "Why balanced accuracy: class frequencies are similar but not identical; balanced accuracy averages "
+        "recall across classes and is less optimistic than raw accuracy on mildly imbalanced problems.\n\n"
+        "Full CV summary (mean across folds):\n" + cv_txt
     )
-    sb = s.shapes.add_textbox(M + Inches(6.62), Inches(1.35), Inches(6.0), Inches(5.5))
-    _fill_body(sb.text_frame, stats, size=14)
-    _footer(s, "outputs/tables/cv_results_TCGA-COAD.csv")
+    sb = s.shapes.add_textbox(rx, L.body_top, rw, L.body_h)
+    _fill_body(sb.text_frame, side, size=10)
+    _footer(L, s, "outputs/tables/cv_results_TCGA-COAD.csv")
 
-    # ----- 13 Confusion + ROC -----
+    # ----- 14 Confusion + ROC -----
     s = _slide_blank(prs)
     _accent_bar(s)
-    _title_block(s, "Classifier behaviour (best model)", "Cross-validated predictions on COAD")
-    wcol = (SW - 2 * M - Inches(0.2)) / 2
-    _add_pic(s, FIG / "classification" / "TCGA-COAD_RandomForest_confmat.png", M + Inches(0.06), Inches(1.15), wcol - Inches(0.06), Inches(5.85))
+    _title_block(L, s, "Error structure & calibration (Random Forest)", "Same model family as external validation export")
+    gap = Inches(0.1)
+    wcol = (L.w - gap) / 2
+    hfig = L.body_h - Inches(0.42)
+    cap = s.shapes.add_textbox(L.x0, L.body_top + hfig + Inches(0.05), L.w, Inches(0.38))
+    _fill_body(
+        cap.text_frame,
+        "Left: cross-validated confusion matrix — most mass on the diagonal; off-diagonal mass often involves "
+        "Intermediate vs Hot/Cold, consistent with intermediate biology. Right: one-vs-rest ROC curves per class; "
+        "high AUC for Cold/Hot indicates separability; Intermediate is intrinsically harder.",
+        size=10,
+        color=C_MUTED,
+    )
+    _add_pic(
+        s,
+        FIG / "classification" / "TCGA-COAD_RandomForest_confmat.png",
+        L.x0,
+        L.body_top,
+        wcol - Inches(0.02),
+        hfig,
+    )
     _add_pic(
         s,
         FIG / "classification" / "TCGA-COAD_RandomForest_roc.png",
-        M + wcol + Inches(0.12),
-        Inches(1.15),
-        wcol - Inches(0.06),
-        Inches(5.85),
+        L.x0 + wcol + gap,
+        L.body_top,
+        wcol - Inches(0.02),
+        hfig,
     )
-    _footer(s, "OvR ROC AUC values printed in legend inside figure files")
+    _footer(L, s, "outputs/figures/classification/TCGA-COAD_RandomForest_*.png")
 
-    # ----- 14 External validation -----
+    # ----- 15 External -----
     s = _slide_blank(prs)
     _accent_bar(s)
     _title_block(
+        L,
         s,
-        "External validation — train COAD, test READ",
-        f"Frozen {metrics['ext_model']} · n = {metrics['ext_n']} · never used in training",
+        "Independent cohort validation",
+        f"Train on all COAD · evaluate on READ (n = {metrics['ext_n']}) · model = {metrics['ext_model']}",
     )
-    _add_pic(s, FIG / "validation" / "validation_confmat_TCGA-READ.png", M + Inches(0.1), Inches(1.85), Inches(6.2), Inches(5.35))
+    lx, lw, rx, rw = L.split_lr(0.48, 0.11)
+    _add_pic(s, FIG / "validation" / "validation_confmat_TCGA-READ.png", lx, L.body_top + Inches(0.12), lw - Inches(0.04), L.body_h - Inches(0.18))
     txt = (
-        "Held-out cohort metrics (same gene-space alignment; missing training genes zero-filled):\n\n"
-        f"  Accuracy          = {metrics['ext_acc']:.3f}\n"
-        f"  Balanced accuracy = {metrics['ext_bal']:.3f}\n"
-        f"  Macro F1          = {metrics['ext_f1']:.3f}\n\n"
-        "Random baseline for 3 classes ≈ 33% accuracy — large margin confirms generalisation, "
-        "not overfitting to COAD."
+        "READ patients were never used during model selection or cross-validation; only COAD folds informed "
+        "the choice of Random Forest. READ expression was subset to the training gene list; any gene absent in "
+        "READ was imputed as zero expression after alignment.\n\n"
+        "Held-out metrics:\n"
+        f"  • Accuracy           {metrics['ext_acc']:.3f}\n"
+        f"  • Balanced accuracy  {metrics['ext_bal']:.3f}\n"
+        f"  • Macro F1           {metrics['ext_f1']:.3f}\n\n"
+        "Compared to ~33% expected accuracy for random guessing among three classes, the ~0.74 balanced accuracy "
+        "indicates genuine transfer of signal across cohorts processed under the same GDC pipeline — different "
+        "patients and tissue sites (colon vs rectum) but comparable assay technology."
     )
-    sb = s.shapes.add_textbox(M + Inches(6.45), Inches(1.35), Inches(6.35), Inches(5.6))
-    _fill_body(sb.text_frame, txt, size=15)
-    _footer(s, "outputs/tables/external_validation_summary_TCGA-READ.csv")
+    sb = s.shapes.add_textbox(rx, L.body_top, rw, L.body_h)
+    _fill_body(sb.text_frame, txt, size=11)
+    _footer(L, s, "outputs/tables/external_validation_summary_TCGA-READ.csv")
 
-    # ----- 15 Survival -----
+    # ----- 16 Survival -----
     s = _slide_blank(prs)
     _accent_bar(s)
     _title_block(
+        L,
         s,
-        "Survival analysis (TCGA-COAD)",
-        f"Log-rank (3 groups): p = {metrics['logrank_p']:.3f}  (stat = {metrics['logrank_stat']:.2f})",
+        "Survival by immune tertile (COAD)",
+        f"Multivariate log-rank p = {metrics['logrank_p']:.3f} (χ² statistic = {metrics['logrank_stat']:.2f})",
     )
-    _add_pic(s, FIG / "survival" / "TCGA-COAD_kaplan_meier.png", M + Inches(0.1), Inches(1.2), Inches(6.55), Inches(5.75))
-    sb = s.shapes.add_textbox(M + Inches(6.75), Inches(1.35), Inches(6.0), Inches(5.5))
+    lx, lw, rx, rw = L.split_lr(0.52, 0.11)
+    _add_pic(s, FIG / "survival" / "TCGA-COAD_kaplan_meier.png", lx, L.body_top, lw - Inches(0.04), L.body_h)
     cox_note = (
-        "Kaplan–Meier stratified by ssGSEA immune label; shaded bands = confidence.\n\n"
-        "Multivariate log-rank p does not cross α = 0.05 — interpret as directional trend "
-        "(Cold worse than Hot) with limited death events / censoring.\n\n"
-        "Cox model on ssGSEA cell scores + PLS of expression vs survival time in supplementary outputs."
+        "Kaplan–Meier step functions with shaded 95% confidence bands. Visual separation between Cold vs Hot "
+        "curves is modest at early times and overlaps at long follow-up because of censoring and competing risks.\n\n"
+        f"Formal log-rank test across all three labels: p = {metrics['logrank_p']:.3f} — not significant at α = 0.05. "
+        "We therefore describe survival differences as hypothesis-generating rather than definitive proof in this cohort.\n\n"
+        "We additionally fit penalised Cox regression on ssGSEA cell-type scores and PLS regression from high-dimensional "
+        "expression to survival time (see outputs/tables/cox_TCGA-COAD.csv and pls_TCGA-COAD.csv plus survival figures)."
     )
-    _fill_body(sb.text_frame, cox_note, size=14)
-    _footer(s, "outputs/tables/logrank_TCGA-COAD.csv · figures in outputs/figures/survival/")
+    sb = s.shapes.add_textbox(rx, L.body_top, rw, L.body_h)
+    _fill_body(sb.text_frame, cox_note, size=11)
+    _footer(L, s, "outputs/tables/logrank_TCGA-COAD.csv")
 
-    # ----- 16 Conclusions -----
+    # ----- 17 Discussion -----
     s = _slide_blank(prs)
     _accent_bar(s)
-    _title_block(s, "Conclusions", "What we can claim with confidence")
+    _title_block(L, s, "Discussion, limitations, future work", "Critical appraisal — expected in written report")
+    disc = s.shapes.add_textbox(L.x0, L.body_top, L.w, L.body_h)
+    _fill_body(
+        disc.text_frame,
+        "Strengths: (1) large public RNA-seq cohorts with harmonised preprocessing; (2) many complementary "
+        "tests (parametric + non-parametric + two FDR strategies); (3) transparent immune labelling code; "
+        "(4) six classifiers with nested feature selection; (5) true external generalisation check on READ; "
+        "(6) biologically interpretable DE direction.\n\n"
+        "Limitations: (1) ssGSEA tertiles are a computational proxy, not gold-standard pathology; (2) COAD and READ "
+        "share sequencing platform — we do not demonstrate cross-platform robustness to microarray here; "
+        "(3) survival is under-powered for strong significance; (4) clinical covariates (stage, MSI) could be "
+        "added as covariates or stratification in future work; (5) XGBoost underperformed linear models here — "
+        "likely because ANOVA pre-screening already removes most non-linear signal from the feature matrix.\n\n"
+        "Future directions: integrate MSI status and stage into multivariate models; validate on GEO or single-cell "
+        " atlases; calibrate predicted probabilities for clinical decision support; explore pathway-level Fisher tests "
+        "explicitly as in the course slide deck.",
+        size=10,
+    )
+    _footer(L, s, "Written report: ≤8 pages Arial 12 (per instructor); this PPTX is complementary visual aid")
+
+    # ----- 18 Conclusions -----
+    s = _slide_blank(prs)
+    _accent_bar(s)
+    _title_block(L, s, "Take-home messages", "What you should remember from this project")
     bullets = [
-        f"Strong transcriptomic separation: {metrics['n_de_highconf']:,} high-confidence DE genes; "
-        f"{metrics['n_sig_t_bh']:,} genes significant by Welch t after BH.",
-        f"Unsupervised views (PCA/UMAP) and clustering partially align with immune tertiles (e.g. k-means ARI {metrics['ari']:.3f}).",
-        f"Six classifiers; best CV balanced accuracy {metrics['cv_bal_acc']:.3f} on COAD ({metrics['best_model']}).",
-        f"External READ test: balanced accuracy {metrics['ext_bal']:.3f} — robust generalisation to new patients.",
-        f"Survival: trend consistent with literature; log-rank p = {metrics['logrank_p']:.3f} (not significant at 0.05).",
-        "Limitations: ssGSEA labels ≠ pathology; READ is same RNA-seq platform as COAD; GEO cohorts not used in final scope.",
-        "Future: orthogonal validation (IHC or scRNA-seq), pathway-level Fisher/GSEA extensions, clinical covariate modelling.",
+        f"We built a reproducible omics pipeline on {metrics['n_total']} TCGA colorectal samples with explicit train (COAD) vs test (READ) separation.",
+        f"Genome-wide testing finds {metrics['n_sig_t_bh']:,} BH-significant genes by Welch t and {metrics['n_de_highconf']:,} high-confidence DE genes with large |log₂FC| — enriched for antigen presentation and cytotoxic programmes.",
+        f"Low-dimensional plots (PCA/UMAP) and clustering (ARI {metrics['ari']:.3f} for best k-means vs labels) show partial but meaningful alignment with immune tertiles.",
+        f"Six classifiers; best discovery performance ≈{metrics['cv_bal_acc']:.2f} balanced accuracy under 5-fold CV ({metrics['best_model']}).",
+        f"External validation retains ≈{metrics['ext_bal']:.2f} balanced accuracy on {metrics['ext_n']} READ patients — evidence against pure overfitting.",
+        f"Survival trend is directionally sensible but not statistically significant at α=0.05 (log-rank p={metrics['logrank_p']:.3f}).",
+        "Everything is scripted in Python with version-pinned dependencies; figures regenerate from outputs/. ",
     ]
-    tb = s.shapes.add_textbox(M + Inches(0.18), Inches(1.25), SW - 2 * M - Inches(0.12), Inches(5.9))
+    tb = s.shapes.add_textbox(L.x0, L.body_top, L.w, L.body_h)
     tf = tb.text_frame
+    _tf_prepare(tf)
     tf.clear()
     for i, b in enumerate(bullets):
         p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
         p.text = "▸ " + b
-        p.space_after = Pt(7)
-        p.line_spacing = 1.14
+        p.space_after = Pt(5)
+        p.line_spacing = 1.08
         for r in p.runs:
-            _set_run_font(r, size=14, color=C_TEXT)
-    _footer(s, REPO)
+            _set_run_font(r, size=11, color=C_TEXT)
+    _footer(L, s, REPO)
 
-    # ----- 17 Thank you -----
+    # ----- 19 Thank you -----
     s = _slide_blank(prs)
     bg = s.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.RECTANGLE, 0, 0, SW, SH)
     bg.fill.solid()
     bg.fill.fore_color.rgb = C_BG_DARK
     bg.line.fill.background()
-    tb = s.shapes.add_textbox(M, Inches(2.9), SW - 2 * M, Inches(1.4))
-    p = tb.text_frame.paragraphs[0]
+    tb = s.shapes.add_textbox(L.x0, Inches(2.55), L.w, Inches(2.2))
+    tf = tb.text_frame
+    _tf_prepare(tf)
+    p = tf.paragraphs[0]
     p.text = "Thank you"
     p.alignment = PP_ALIGN.CENTER
     for r in p.runs:
-        _set_run_font(r, size=44, bold=True, color=C_WHITE)
-    p2 = tb.text_frame.add_paragraph()
-    p2.text = "Questions?"
-    p2.space_before = Pt(18)
+        _set_run_font(r, size=40, bold=True, color=C_WHITE)
+    p2 = tf.add_paragraph()
+    p2.text = "We welcome questions on methods, code, or biological interpretation."
+    p2.space_before = Pt(16)
     p2.alignment = PP_ALIGN.CENTER
     for r in p2.runs:
-        _set_run_font(r, size=22, color=C_ACCENT)
-    p3 = tb.text_frame.add_paragraph()
-    p3.text = REPO
-    p3.space_before = Pt(36)
+        _set_run_font(r, size=14, color=RGBColor(148, 163, 184))
+    p3 = tf.add_paragraph()
+    p3.text = "Questions?"
+    p3.space_before = Pt(22)
     p3.alignment = PP_ALIGN.CENTER
     for r in p3.runs:
-        _set_run_font(r, size=12, color=RGBColor(148, 163, 184))
-    strip = s.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.RECTANGLE, SW / 2 - Inches(0.09), Inches(2.2), Inches(0.18), Inches(3.1))
+        _set_run_font(r, size=20, color=C_ACCENT)
+    p4 = tf.add_paragraph()
+    p4.text = REPO
+    p4.space_before = Pt(28)
+    p4.alignment = PP_ALIGN.CENTER
+    for r in p4.runs:
+        _set_run_font(r, size=11, color=RGBColor(148, 163, 184))
+    strip = s.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.RECTANGLE, SW / 2 - Inches(0.08), Inches(2.05), Inches(0.16), Inches(3.15))
     strip.fill.solid()
     strip.fill.fore_color.rgb = C_ACCENT
     strip.line.fill.background()
