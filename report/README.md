@@ -24,3 +24,12 @@ source .venv/bin/activate
 pip install -r requirements.txt   # includes python-pptx
 python report/build_presentation.py
 ```
+
+## Team briefing (Markdown + PDF)
+
+- **Markdown:** `../TEAM_PROJECT_FULL_SUMMARY.md` — detailed narrative for teammates (pipeline, metrics, train vs READ, FAQ, references).
+- **PDF:** `../TEAM_PROJECT_FULL_SUMMARY.pdf` — opens with **live tables** from `outputs/tables/`, then the briefing text. Regenerate after re-running the pipeline:
+
+```bash
+python report/generate_team_briefing_pdf.py
+```
