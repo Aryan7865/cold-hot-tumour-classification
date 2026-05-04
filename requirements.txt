@@ -30,3 +30,4 @@ xgboost>=3.2.0
 
 # Report generation
 reportlab>=4.4
+python-pptx>=1.0.2
